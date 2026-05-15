@@ -11,6 +11,7 @@ const DASHBOARD_API_CONFIG = window.DASHBOARD_API_CONFIG || {};
 const API_BASE_URL = String(DASHBOARD_API_CONFIG.baseUrl || '').trim();
 const API_TIMEOUT_MS = 20000;
 const API_TRIPS_TIMEOUT_MS = 45000;
+const COMPARE_TRIPS_WAIT_MS = 12000;
 const API_CACHE = { summary: null, trips: null, oil: null };
 const LEGACY_SCRIPT_PROMISES = {};
 let TRIPS_READY = false;
@@ -5071,11 +5072,22 @@ function showPage(idx) {
         </div>
       </div>`;
     c.scrollTop = 0;
-    ensureTripsReady().then(() => {
+    const guardedReady = Promise.race([
+      ensureTripsReady(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('compare trips wait timeout')), COMPARE_TRIPS_WAIT_MS))
+    ]);
+
+    guardedReady.then(() => {
       if (currentPage !== 1) return;
       c.innerHTML = `${renderDataSourceNotice()}${builders[1](DATA)}`;
       c.scrollTop = 0;
-    }).catch(err => {
+    }).catch(async err => {
+      const legacy = await tryLegacyTripsFallback('trips compare timeout fallback: local static data');
+      if (legacy && currentPage === 1) {
+        c.innerHTML = `${renderDataSourceNotice()}${builders[1](DATA)}`;
+        c.scrollTop = 0;
+        return;
+      }
       if (currentPage !== 1) return;
       c.innerHTML = `
         ${renderDataSourceNotice()}
@@ -5207,6 +5219,26 @@ async function ensureTripsReady() {
   });
 
   return TRIPS_LOADING_PROMISE;
+}
+
+async function tryLegacyTripsFallback(reason = '') {
+  try {
+    // If FRAUD_DATA is an empty bootstrap placeholder, remove it so legacy script can load.
+    if (Array.isArray(window.FRAUD_DATA) && window.FRAUD_DATA.length === 0) {
+      try { delete window.FRAUD_DATA; } catch (_) { window.FRAUD_DATA = undefined; }
+    }
+    const legacyRows = await loadLegacyTripsData();
+    const normalized = Array.isArray(legacyRows) ? legacyRows.map(canonicalizeTripRow) : [];
+    if (normalized.length > 0) {
+      window.FRAUD_DATA = normalized;
+      TRIPS_READY = true;
+      noteDataSource('trips', 'static', reason || 'trips fallback: local static data');
+      return deepClone(normalized);
+    }
+  } catch (err) {
+    console.warn('Legacy trips fallback failed:', err?.message || err);
+  }
+  return null;
 }
 
 function startTripsPreload() {
@@ -5365,7 +5397,11 @@ async function init() {
     rebuildDerived: false
   });
   DATA = aligned.data;
-  window.FRAUD_DATA = aligned.trips;
+  if (Array.isArray(aligned.trips) && aligned.trips.length > 0) {
+    window.FRAUD_DATA = aligned.trips;
+  } else {
+    try { delete window.FRAUD_DATA; } catch (_) { window.FRAUD_DATA = undefined; }
+  }
   TRIPS_READY = Array.isArray(window.FRAUD_DATA) && window.FRAUD_DATA.length > 0;
   if (oilSource) {
     window.OIL_PRICE_DATA = oilSource;
